@@ -157,8 +157,8 @@ The `status` always reflects the current state of a classification no matter if 
 Of course the new version classification lifecycles must be compatible with `NamespacedCloudProfile`s. This leads to some special cases to ensure the overridden `CloudProfile` inside `NamespacedCloudProfile.Status` itself always produces a valid `CloudProfile`.
 
 In the previous implementation a version's `classification` could not be changed, while adding or changing the `expirationDate` was allowed. This GEP exactly retains this behavior.
-Accordingly, users can only specify a lifecycle with an expired stage in `NamespacedCloudProfiles`, specifying or overriding other stage is not allowed.
-
+Accordingly, users can only add or override the `expired` stage in `NamespacedCloudProfiles`.
+Adding or overriding any other lifecycle stage is not allowed.
 Given the `CloudProfile` from above, the following `NamespacedCloudProfile` is valid:
 
 ```yaml
@@ -183,7 +183,7 @@ spec:
             startTime: "2040-01-07T06:28:16Z"
 status:
   cloudProfileSpec:
-      kubernetes:
+    kubernetes:
       versions:
         - version: 1.27.0 # from base
 
@@ -191,76 +191,84 @@ status:
           lifecycle:
             - classification: preview # from base
             - classification: supported
-              startTime: "2025-12-01T00:00:00Z" # override
-  
+              startTime: "2024-12-01T00:00:00Z" # from base
+
         - version: 1.18.0
           lifecycle:
             - classification: supported
-              startTime: "2022-01-01T00:00:00Z" # override
             - classification: deprecated
-              startTime: "2024-06-01T00:00:00Z" # override
+              startTime: "2022-01-01T00:00:00Z" # from base
             - classification: expired
-              startTime: "2024-06-01T00:00:00Z" # implicit override, explained below
+              startTime: "2024-06-01T00:00:00Z" # expiration override
 
-        # from base
         - version: 2.0.0
           lifecycle:
-            - classification: preview
+            - classification: preview # from base
               startTime: "2036-02-07T06:28:16Z"
+            - classification: expired
+              startTime: "2040-01-07T06:28:16Z" # expiration added
 ```
 
 Declaring and updating a `NamespacedCloudProfile` is straightforward and creating an invalid `NamespacedCloudProfile.Status` is prevented by our existing validations.
 
-We don't allow overriding existing stages or introducing new stages, because this might lead to unintended results during merging:
+We don't allow adding or overriding lifecycle stages other than `expired`, because merging individual lifecycle stages can lead to unintended results:
 
-1. The start time of the `deprecated` stage might be between the ones of `preview` or `supported`, which would be invalid. Automatically adapting the start time of the `supported` stage in the controller would contradict the user's intent from the `NamespacedCloudProfile`.
+1. The start time of the `deprecated` stage might be between the ones of `preview` or `supported`, which would be invalid. Automatically adapting the start time of the `supported` stage in the controller would contradict the parent `CloudProfile`.
 2. Postponing the start time of the `preview` stage to be later than the start time of the `supported` stage in the parent would be invalid. Automatically adapting the start time of the `supported` stage in the controller to be at the same start time as the overwritten `preview` stage would skip the preview stage entirely, again contradicting the user's intent.
 
 These two scenarios are illustrated in the following example:
 ```yaml
-# parent CloudProfile
+# Parent CloudProfile
 versions:
 - version: 1.0.0
   lifecycle:
-  - stage: preview
+  - classification: preview
     startTime: "2026-06-01T00:00:00Z"
-  - stage: supported
+  - classification: supported
     startTime: "2026-08-01T00:00:00Z"
+  - classification: deprecated
+    startTime: "2026-10-01T00:00:00Z"
+  - classification: expired
+    startTime: "2026-12-01T00:00:00Z"
+
 - version: 2.0.0
   lifecycle:
-  - stage: preview
+  - classification: preview
     startTime: "2026-06-01T00:00:00Z"
-  - stage: supported
+  - classification: supported
     startTime: "2026-08-01T00:00:00Z"
 
 # NamespacedCloudProfile
 versions:
 - version: 1.0.0
   lifecycle:
-  - stage: deprecated
-    startTime: "2026-07-01T00:00:00Z"
+  - classification: deprecated
+    startTime: "2026-07-01T00:00:00Z" # earlier then the parent supported
+
 - version: 2.0.0
   lifecycle:
-  - stage: preview
-    startTime: "2026-09-01T00:00:00Z"
+  - classification: preview
+    startTime: "2026-09-01T00:00:00Z" # later then the parent supported
 
 # result
 versions:
 - version: 1.0.0 # case 1
   lifecycle:
-  - stage: preview
+  - classification: preview
     startTime: "2026-06-01T00:00:00Z"
-  - stage: supported
-    startTime: "2026-08-01T00:00:00Z" # would need to be advanced to 2026-07-01, otherwise invalid
-  - stage: deprecated
-    startTime: "2026-07-01T00:00:00Z" # invalid, start times are not monotonically increasing
+  - classification: supported
+    startTime: "2026-08-01T00:00:00Z" # would need to be advanced to 2026-07-01, which would make deprecated supersede supported
+  - classification: deprecated
+    startTime: "2026-07-01T00:00:00Z" # invalid: earlier than parent supported
+  - classification: expired
+    startTime: "2026-12-01T00:00:00Z"
 
 - version: 2.0.0 # case 2
   lifecycle:
-  - stage: preview
-    startTime: "2026-09-01T00:00:00Z" # invalid, start times are not monotonically increasing
-  - stage: supported
-    startTime: "2026-08-01T00:00:00Z" # would need to be postponed to 2026-09-01, but this would skip the preview stage
+  - classification: preview
+    startTime: "2026-09-01T00:00:00Z" # invalid: later than parent supported
+  - classification: supported
+    startTime: "2026-08-01T00:00:00Z" # would need to be postponed to 2026-09-01, which would make supported supersede preview
 ```
 
 ## Future Enhancements
