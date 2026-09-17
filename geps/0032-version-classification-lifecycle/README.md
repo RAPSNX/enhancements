@@ -156,9 +156,8 @@ The `status` always reflects the current state of a classification no matter if 
 
 Of course the new version classification lifecycles must be compatible with `NamespacedCloudProfile`s. This leads to some special cases to ensure the overridden `CloudProfile` inside `NamespacedCloudProfile.Status` itself always produces a valid `CloudProfile`.
 
-In the previous implementation a version's `classification` could not be changed, while adding or changing the `expirationDate` was allowed. This GEP exactly retains this behavior.
-Accordingly, users can only add or override the `expired` stage in `NamespacedCloudProfiles`.
-Adding or overriding any other lifecycle stage is not allowed.
+If a `NamespacedCloudProfile` specifies a `lifecycle` for a Kubernetes or machine image version that already exists in the parent `CloudProfile`, it replaces the parent lifecycle for that version entirely. If no `lifecycle` is specified for a version, the parent lifecycle is inherited unchanged. The lifecycle specified in a `NamespacedCloudProfile` must satisfy the same validation rules as a lifecycle in the parent `CloudProfile`. Restricting who may set a `lifecycle` in a `NamespacedCloudProfile` is already covered by the existing custom RBAC verbs for the `kubernetes` and `machineImages` fields (see [GEP-0025](../0025-namespaced-cloudprofiles/README.md#custom-rbac-verb)).
+
 Given the `CloudProfile` from above, the following `NamespacedCloudProfile` is valid:
 
 ```yaml
@@ -174,44 +173,61 @@ spec:
 
       - version: 1.18.0
         lifecycle:
+          - classification: supported
+          - classification: deprecated
+            startTime: "2022-01-01T00:00:00Z"
           - classification: expired
-            startTime: "2024-06-01T00:00:00Z" # postponing expiration of this version (later than the start time in the parent CloudProfile)
+            startTime: "2024-06-01T00:00:00Z" # replaces the parent lifecycle entirely, postponing expiration
 
       - version: 2.0.0
         lifecycle:
-          - classification: expired # adding an expiration time of this version (the parent CloudProfile doesn't specify one)
+          - classification: supported # replaces the parent lifecycle entirely (the parent only defines a preview stage)
             startTime: "2040-01-07T06:28:16Z"
 status:
   cloudProfileSpec:
     kubernetes:
       versions:
-        - version: 1.27.0 # from base
+        - version: 1.27.0 # from base, no override
 
         - version: 1.28.0
           lifecycle:
-            - classification: preview # from base
+            - classification: preview # from base, no override
             - classification: supported
-              startTime: "2024-12-01T00:00:00Z" # from base
+              startTime: "2024-12-01T00:00:00Z"
 
         - version: 1.18.0
           lifecycle:
-            - classification: supported
+            - classification: supported # replaces the parent lifecycle
             - classification: deprecated
-              startTime: "2022-01-01T00:00:00Z" # from base
+              startTime: "2022-01-01T00:00:00Z"
             - classification: expired
-              startTime: "2024-06-01T00:00:00Z" # expiration override
+              startTime: "2024-06-01T00:00:00Z"
 
         - version: 2.0.0
           lifecycle:
-            - classification: preview # from base
-              startTime: "2036-02-07T06:28:16Z"
-            - classification: expired
-              startTime: "2040-01-07T06:28:16Z" # expiration added
+            - classification: supported # replaces the parent lifecycle
+              startTime: "2040-01-07T06:28:16Z"
 ```
 
 Declaring and updating a `NamespacedCloudProfile` is straightforward and creating an invalid `NamespacedCloudProfile.Status` is prevented by our existing validations.
 
-We don't allow adding or overriding lifecycle stages other than `expired`, because merging individual lifecycle stages can lead to unintended results:
+#### Validation Against Versions in Use
+
+Regardless of the override semantics, the API must reject any `NamespacedCloudProfile` change, or a `Shoot`'s `cloudProfile` reference change, that would render a Kubernetes or machine image version currently in use by that `Shoot` `unavailable`.
+
+#### Known Limitations
+
+- **Drift from parent updates**: once a `NamespacedCloudProfile` overrides a version's lifecycle, it no longer receives future changes to that version's lifecycle in the parent `CloudProfile` (e.g. an expedited `expired` date); the override is a point-in-time snapshot, not a living link to the parent.
+- **Copy-paste burden for partial overrides**: because replacement is atomic, overriding a single stage (e.g. postponing `expired`) requires repeating the entire lifecycle, including stages that aren't actually meant to change, which must then be kept in sync with the parent manually.
+- **Backsliding is possible**: full replacement allows a `NamespacedCloudProfile` to declare a lifecycle that is "earlier" than the version's current effective stage in the parent (e.g. re-introducing `supported` for an already `expired` version).
+
+## Considered Alternatives
+
+In addition to the proposed approach, we considered several alternatives or variations of approaches. The main candidates are described below.
+
+### Merging Individual Lifecycle Stages in NamespacedCloudProfiles (dropped)
+
+Instead of replacing the lifecycle entirely, individual stages of a `NamespacedCloudProfile`'s lifecycle could be merged into the parent `CloudProfile`'s lifecycle. This was rejected because merging can lead to unintended results:
 
 1. The start time of the `deprecated` stage might be between the ones of `preview` or `supported`, which would be invalid. Automatically adapting the start time of the `supported` stage in the controller would contradict the parent `CloudProfile`.
 2. Postponing the start time of the `preview` stage to be later than the start time of the `supported` stage in the parent would be invalid. Automatically adapting the start time of the `supported` stage in the controller to be at the same start time as the overwritten `preview` stage would skip the preview stage entirely, again contradicting the user's intent.
@@ -271,31 +287,10 @@ versions:
     startTime: "2026-08-01T00:00:00Z" # would need to be postponed to 2026-09-01, which would make supported supersede preview
 ```
 
-## Future Enhancements
+### Phased Introduction of Full Lifecycle Overrides
 
-### Support Overwriting Version Lifecycles in NamespacedCloudProfiles
-
-In setups where users can't create `NamespacedCloudProfiles`, the operator might want to set different version lifecycles per project.
-In this case, the operator would need to overwrite the lifecycle stages from the parent `CloudProfile` entirely.
-Because this GEP retains the previous behavior that only allows overwriting the expiration date of a version, this use case is not supported yet.
-
-To support this scenario, the operator could allow overwriting the version lifecycles by setting a new field in the parent `CloudProfile` object, e.g.:
-```yaml
-apiVersion: core.gardener.cloud/v1beta1
-kind: CloudProfile
-spec:
-  # up to discussion
-  allowVersionLifecycleOverwrites: true
-```
-
-If this field is set, `NamespacedCloudProfiles` can specify a full version lifecycle for kubernetes and machine image versions.
-If the lifecycle is set for a given version, the `NamespacedCloudProfile` version lifecycle takes precedence and the parent lifecycle is overwritten entirely.
-Specifying a version lifecycle overwrite must match the same validations as in the parent `CloudProfile`.
-Introducing new versions in a `NamespacedCloudProfile` is not allowed.
-
-## Considered Alternatives
-
-In addition to the proposed approach, we considered several alternatives or variations of approaches. The main candidates are described below.
+An intermediate step to retain the legacy classification behavior was also considered: allowing only `expired` overrides for now and adding full lifecycle override as a feature later.
+This was rejected because introducing full override afterwards would itself be a backward-compatibility break — it would change the lifecycle of an already created `NamespacedCloudProfile` without the user's intent, if an operator enables full overrides later.
 
 ### Consequent Continuation of Current Approach
 
