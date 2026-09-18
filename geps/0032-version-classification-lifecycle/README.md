@@ -156,7 +156,18 @@ The `status` always reflects the current state of a classification no matter if 
 
 Of course the new version classification lifecycles must be compatible with `NamespacedCloudProfile`s. This leads to some special cases to ensure the overridden `CloudProfile` inside `NamespacedCloudProfile.Status` itself always produces a valid `CloudProfile`.
 
-If a `NamespacedCloudProfile` specifies a `lifecycle` for a Kubernetes or machine image version that already exists in the parent `CloudProfile`, it replaces the parent lifecycle for that version entirely. If no `lifecycle` is specified for a version, the parent lifecycle is inherited unchanged. The lifecycle specified in a `NamespacedCloudProfile` must satisfy the same validation rules as a lifecycle in the parent `CloudProfile`. Restricting who may set a `lifecycle` in a `NamespacedCloudProfile` is already covered by the existing custom RBAC verbs for the `kubernetes` and `machineImages` fields (see [GEP-0025](../0025-namespaced-cloudprofiles/README.md#custom-rbac-verb)).
+With the legacy API, `NamespacedCloudProfile`s can only specify an `expirationDate` for versions inherited from the parent `CloudProfile` and cannot change the `classification`. When specified, the `expirationDate` is merged into the parent version's definition.
+
+With the new API, if a `NamespacedCloudProfile` specifies a `lifecycle` for a Kubernetes or machine image version that already exists in the parent `CloudProfile`, it replaces the parent lifecycle for that version entirely. If no override is specified for a version, the parent version is inherited unchanged. The lifecycle specified in a `NamespacedCloudProfile` must satisfy the same validation rules as a lifecycle in the parent `CloudProfile`. Restricting who may set a `lifecycle` in a `NamespacedCloudProfile` is already covered by the existing custom RBAC verbs for the `kubernetes` and `machineImages` fields (see [GEP-0025](../0025-namespaced-cloudprofiles/README.md#custom-rbac-verb)).
+
+To support smooth upgrades and backward compatibility, the following combination matrix defines how parent definitions and `NamespacedCloudProfile` overrides interact:
+
+| Parent `CloudProfile` | `NamespacedCloudProfile` Override | Resulting Behavior in Status |
+| --------------------- | --------------------------------- | ---------------------------- |
+| `classification` / `expirationDate` | `expirationDate` | **Merged as before**: The `expirationDate` from the `NamespacedCloudProfile` overrides the parent `expirationDate` (or sets one if none was defined). `classification` is inherited from the parent. |
+| `lifecycle` | `expirationDate` | **Expiration stage overwritten**: The `expired` stage in the parent `lifecycle` is added or overwritten with `startTime` set to `expirationDate`. All other parent lifecycle stages are retained unchanged (existing behavior for backward compatibility). |
+| `classification` / `expirationDate` | `lifecycle` | **Entire lifecycle override**: The `lifecycle` from the `NamespacedCloudProfile` replaces the parent version's legacy classification and expiration date entirely. |
+| `lifecycle` | `lifecycle` | **Entire lifecycle override**: The `lifecycle` from the `NamespacedCloudProfile` replaces the parent version's lifecycle entirely. |
 
 Given the `CloudProfile` from above, the following `NamespacedCloudProfile` is valid:
 
@@ -172,16 +183,16 @@ spec:
       # omitted versions will not be changed
 
       - version: 1.18.0
-        lifecycle:
+        lifecycle: # replaces the parent lifecycle entirely, postponing expiration
           - classification: supported
           - classification: deprecated
             startTime: "2022-01-01T00:00:00Z"
           - classification: expired
-            startTime: "2024-06-01T00:00:00Z" # replaces the parent lifecycle entirely, postponing expiration
+            startTime: "2024-06-01T00:00:00Z"
 
       - version: 2.0.0
-        lifecycle:
-          - classification: supported # replaces the parent lifecycle entirely (the parent only defines a preview stage)
+        lifecycle: # replaces the parent lifecycle entirely (the parent only defines a preview stage)
+          - classification: supported
             startTime: "2040-01-07T06:28:16Z"
 status:
   cloudProfileSpec:
@@ -259,12 +270,12 @@ versions:
 - version: 1.0.0
   lifecycle:
   - classification: deprecated
-    startTime: "2026-07-01T00:00:00Z" # earlier then the parent supported
+    startTime: "2026-07-01T00:00:00Z" # earlier than the parent supported
 
 - version: 2.0.0
   lifecycle:
   - classification: preview
-    startTime: "2026-09-01T00:00:00Z" # later then the parent supported
+    startTime: "2026-09-01T00:00:00Z" # later than the parent supported
 
 # result
 versions:
